@@ -348,6 +348,7 @@ func (w *watchCache) processEvent(event watch.Event, resourceVersion uint64, upd
 	if w.eventHandler != nil {
 		w.eventHandler(wcEvent)
 	}
+	metrics.RecordResourceVersion(w.groupResource.String(), resourceVersion)
 	return nil
 }
 
@@ -430,6 +431,7 @@ func (w *watchCache) UpdateResourceVersion(resourceVersion string) {
 		}
 		w.eventHandler(wcEvent)
 	}
+	metrics.RecordResourceVersion(w.groupResource.String(), rv)
 }
 
 // List returns list of pointers to <storeElement> objects.
@@ -499,7 +501,29 @@ func (s sortableStoreElements) Swap(i, j int) {
 
 // WaitUntilFreshAndList returns list of pointers to `storeElement` objects along
 // with their ResourceVersion and the name of the index, if any, that was used.
-func (w *watchCache) WaitUntilFreshAndList(ctx context.Context, resourceVersion uint64, matchValues []storage.MatchValue) (result []interface{}, rv uint64, index string, err error) {
+func (w *watchCache) WaitUntilFreshAndList(ctx context.Context, resourceVersion uint64, key string, matchValues []storage.MatchValue) ([]interface{}, uint64, string, error) {
+	items, rv, index, err := w.waitUntilFreshAndListItems(ctx, resourceVersion, key, matchValues)
+	if err != nil {
+		return nil, 0, "", err
+	}
+
+	var result []interface{}
+	for _, item := range items {
+		elem, ok := item.(*storeElement)
+		if !ok {
+			return nil, 0, "", fmt.Errorf("non *storeElement returned from storage: %v", item)
+		}
+		if !hasPathPrefix(elem.Key, key) {
+			continue
+		}
+		result = append(result, item)
+	}
+
+	sort.Sort(sortableStoreElements(result))
+	return result, rv, index, nil
+}
+
+func (w *watchCache) waitUntilFreshAndListItems(ctx context.Context, resourceVersion uint64, key string, matchValues []storage.MatchValue) (result []interface{}, rv uint64, index string, err error) {
 	requestWatchProgressSupported := etcdfeature.DefaultFeatureSupportChecker.Supports(storage.RequestWatchProgress)
 	if utilfeature.DefaultFeatureGate.Enabled(features.ConsistentListFromCache) && requestWatchProgressSupported && w.notFresh(resourceVersion) {
 		w.waitingUntilFresh.Add()
@@ -509,7 +533,6 @@ func (w *watchCache) WaitUntilFreshAndList(ctx context.Context, resourceVersion 
 		err = w.waitUntilFreshAndBlock(ctx, resourceVersion)
 	}
 
-	defer func() { sort.Sort(sortableStoreElements(result)) }()
 	defer w.RUnlock()
 	if err != nil {
 		return result, rv, index, err
@@ -629,7 +652,9 @@ func (w *watchCache) Replace(objs []interface{}, resourceVersion string) error {
 		w.onReplace()
 	}
 	w.cond.Broadcast()
-	klog.V(3).Infof("Replace watchCache (rev: %v) ", resourceVersion)
+
+	metrics.RecordResourceVersion(w.groupResource.String(), version)
+	klog.V(3).Infof("Replaced watchCache (rev: %v) ", resourceVersion)
 	return nil
 }
 
@@ -763,7 +788,7 @@ func (w *watchCache) getAllEventsSinceLocked(resourceVersion uint64, key string,
 	indexerFunc := func(i int) *watchCacheEvent {
 		return w.cache[i%w.capacity]
 	}
-	ci := newCacheInterval(w.startIndex+first, w.endIndex, indexerFunc, w.indexValidator, &w.RWMutex)
+	ci := newCacheInterval(w.startIndex+first, w.endIndex, indexerFunc, w.indexValidator, w.RWMutex.RLocker())
 	return ci, nil
 }
 

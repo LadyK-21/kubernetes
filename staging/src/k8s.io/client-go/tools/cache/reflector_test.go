@@ -231,7 +231,7 @@ func TestReflectorHandleWatchStoppedBefore(t *testing.T) {
 			return resultCh
 		},
 	}
-	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, stopCh)
+	err := handleWatch(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, g.clock, nevererrc, stopCh)
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
@@ -267,7 +267,7 @@ func TestReflectorHandleWatchStoppedAfter(t *testing.T) {
 			return resultCh
 		},
 	}
-	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, stopCh)
+	err := handleWatch(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, g.clock, nevererrc, stopCh)
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
@@ -295,7 +295,7 @@ func TestReflectorHandleWatchResultChanClosedBefore(t *testing.T) {
 	}
 	// Simulate the result channel being closed by the producer before handleWatch is called.
 	close(resultCh)
-	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, wait.NeverStop)
+	err := handleWatch(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, g.clock, nevererrc, wait.NeverStop)
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
@@ -328,7 +328,7 @@ func TestReflectorHandleWatchResultChanClosedAfter(t *testing.T) {
 			return resultCh
 		},
 	}
-	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, wait.NeverStop)
+	err := handleWatch(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, g.clock, nevererrc, wait.NeverStop)
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
@@ -362,8 +362,9 @@ func TestReflectorWatchHandler(t *testing.T) {
 		fw.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "baz", ResourceVersion: "32"}})
 		fw.Stop()
 	}()
-	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, setLastSyncResourceVersion, nil, g.clock, nevererrc, stopCh)
-	if !errors.Is(err, errorStopRequested) {
+	err := handleWatch(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, setLastSyncResourceVersion, g.clock, nevererrc, stopCh)
+	// TODO(karlkfi): Fix FakeWatcher to avoid race condition between watcher.Stop() & close(stopCh)
+	if err != nil && !errors.Is(err, errorStopRequested) {
 		t.Errorf("unexpected error %v", err)
 	}
 
@@ -406,7 +407,7 @@ func TestReflectorStopWatch(t *testing.T) {
 	fw := watch.NewFake()
 	stopWatch := make(chan struct{})
 	close(stopWatch)
-	err := watchHandler(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, nil, g.clock, nevererrc, stopWatch)
+	err := handleWatch(time.Now(), fw, s, g.expectedType, g.expectedGVK, g.name, g.typeDescription, g.setLastSyncResourceVersion, g.clock, nevererrc, stopWatch)
 	if err != errorStopRequested {
 		t.Errorf("expected stop error, got %q", err)
 	}
@@ -697,10 +698,56 @@ func TestBackoffOnTooManyRequests(t *testing.T) {
 	}
 
 	stopCh := make(chan struct{})
-	r.ListAndWatch(stopCh)
+	if err := r.ListAndWatch(stopCh); err != nil {
+		t.Fatal(err)
+	}
 	close(stopCh)
 	if bm.calls != 2 {
 		t.Errorf("unexpected watch backoff calls: %d", bm.calls)
+	}
+}
+
+func TestNoRelistOnTooManyRequests(t *testing.T) {
+	err := apierrors.NewTooManyRequests("too many requests", 1)
+	clock := &clock.RealClock{}
+	bm := &fakeBackoff{clock: clock}
+	listCalls, watchCalls := 0, 0
+
+	lw := &testLW{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			listCalls++
+			return &v1.PodList{ListMeta: metav1.ListMeta{ResourceVersion: "1"}}, nil
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			watchCalls++
+			if watchCalls < 5 {
+				return nil, err
+			}
+			w := watch.NewFake()
+			w.Stop()
+			return w, nil
+		},
+	}
+
+	r := &Reflector{
+		name:              "test-reflector",
+		listerWatcher:     lw,
+		store:             NewFIFO(MetaNamespaceKeyFunc),
+		backoffManager:    bm,
+		clock:             clock,
+		watchErrorHandler: WatchErrorHandler(DefaultWatchErrorHandler),
+	}
+
+	stopCh := make(chan struct{})
+	if err := r.ListAndWatch(stopCh); err != nil {
+		t.Fatal(err)
+	}
+	close(stopCh)
+	if listCalls != 1 {
+		t.Errorf("unexpected list calls: %d", listCalls)
+	}
+	if watchCalls != 5 {
+		t.Errorf("unexpected watch calls: %d", watchCalls)
 	}
 }
 
